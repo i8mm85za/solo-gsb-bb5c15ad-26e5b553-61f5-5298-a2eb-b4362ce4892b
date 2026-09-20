@@ -854,3 +854,192 @@ def test_coverage_plan_extra_field_rejected_422():
         }
     )
     assert response.status_code == 422
+
+
+def _post_q_steer(payload):
+    return client.post("/api/v1/negotiate/q-steer", json=payload)
+
+
+def test_q_steer_already_selected():
+    response = _post_q_steer(
+        {
+            "accept_language": "zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "target_language": "zh-CN",
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "already-selected"
+    assert body["baseline"]["selected_language"] == "zh-CN"
+    assert body["baseline"]["fallback"] is False
+    assert "recommendation" not in body
+    assert "adjusted" not in body
+    assert "ranges" not in body
+    # Baseline is the full /negotiate payload; locale_fallback omitted.
+    assert "locale_fallback" not in body["baseline"]
+    assert len(body["baseline"]["candidates"]) == 4
+
+
+def test_q_steer_recommended():
+    response = _post_q_steer(
+        {
+            "accept_language": "zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "target_language": "zh-TW",
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "recommended"
+    assert body["recommendation"] == {
+        "range": "zh-cn",
+        "position": 1,
+        "original_q": 1.0,
+        "new_q": 0.899,
+    }
+    assert body["baseline"]["selected_language"] == "zh-CN"
+    adjusted = body["adjusted"]
+    assert adjusted["selected_language"] == "zh-TW"
+    assert adjusted["selected_supported_index"] == 2
+    assert adjusted["fallback"] is False
+    # The adjusted result is itself a full negotiation payload.
+    adjusted_ranges = adjusted["parsed_ranges"]
+    assert adjusted_ranges[0]["q"] == 0.899
+    assert [r["range"] for r in adjusted_ranges] == ["zh-cn", "zh", "en", "*"]
+    assert "ranges" not in body
+
+
+def test_q_steer_unreachable():
+    response = _post_q_steer(
+        {
+            "accept_language": "de;q=0.9,*;q=0.5",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "target_language": "ja-JP",
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "unreachable"
+    assert body["baseline"]["selected_language"] == "en-US"
+    assert body["ranges"] == [
+        {"range": "de", "position": 1, "original_q": 0.9, "reachable": False},
+        {"range": "*", "position": 2, "original_q": 0.5, "reachable": False},
+    ]
+    assert "recommendation" not in body
+    assert "adjusted" not in body
+
+
+def test_q_steer_target_case_insensitive():
+    response = _post_q_steer(
+        {
+            "accept_language": "zh-CN",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "target_language": "zh-cn",
+        }
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "already-selected"
+
+
+def test_q_steer_target_not_in_supported_422():
+    response = _post_q_steer(
+        {
+            "accept_language": "en",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "target_language": "fr-FR",
+        }
+    )
+    assert response.status_code == 422
+
+
+def test_q_steer_invalid_target_tag_422():
+    response = _post_q_steer(
+        {
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "target_language": "not a tag",
+        }
+    )
+    assert response.status_code == 422
+
+
+def test_q_steer_missing_target_422():
+    response = _post_q_steer(
+        {
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 422
+
+
+def test_q_steer_invalid_header_422():
+    response = _post_q_steer(
+        {
+            "accept_language": "en;q=2",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "target_language": "en-US",
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "accept_language"]
+    assert detail[0]["type"] == "accept_language.syntax_error"
+
+
+def test_q_steer_extra_field_rejected_422():
+    response = _post_q_steer(
+        {
+            "supported_languages": ["en"],
+            "default_language": "en",
+            "target_language": "en",
+            "unexpected": 1,
+        }
+    )
+    assert response.status_code == 422
+
+
+def test_q_steer_locale_fallback_present_in_baseline_and_adjusted():
+    response = _post_q_steer(
+        {
+            "accept_language": "gsw;q=0.9,fr;q=0.5",
+            "supported_languages": ["en-US", "zh-TW", "ja-JP"],
+            "default_language": DEFAULT,
+            "locale_fallbacks": {
+                "gsw": "de",
+                "de": "zh-TW",
+                "fr": "ja-JP",
+            },
+            "target_language": "ja-JP",
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "recommended"
+    assert body["recommendation"]["range"] == "gsw"
+    assert body["recommendation"]["new_q"] == 0.499
+    assert body["baseline"]["locale_fallback"]["selected_language"] == "zh-TW"
+    assert body["adjusted"]["locale_fallback"]["selected_language"] == "ja-JP"
+    assert body["adjusted"]["locale_fallback"]["source_range"] == "fr"
+
+
+def test_q_steer_blank_header_target_default_already_selected():
+    response = _post_q_steer(
+        {
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "target_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "already-selected"
+    assert body["baseline"]["fallback"] is True
+    assert body["baseline"]["fallback_reason"] == "no-valid-range"

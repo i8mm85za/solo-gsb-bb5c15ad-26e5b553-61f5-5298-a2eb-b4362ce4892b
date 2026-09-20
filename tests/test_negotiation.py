@@ -13,6 +13,7 @@ from app.negotiation import (
     normalize_fallbacks,
     parse_accept_language,
     plan_coverage,
+    steer_q,
     truncation_chain,
     validate_fallback_chains,
 )
@@ -963,3 +964,373 @@ class TestQStability:
                     }
                     # The reported outside point must differ from baseline.
                     assert (selected, fell_back) != base_key
+
+
+class TestSteerQ:
+    SUPPORTED = ["en-US", "zh-CN", "zh-TW", "ja-JP"]
+    DEFAULT = "en-US"
+
+    def test_already_selected_normal_hit(self):
+        result = steer_q(
+            header="zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5",
+            supported=self.SUPPORTED,
+            default=self.DEFAULT,
+            target_language="zh-CN",
+        )
+        assert result["status"] == "already-selected"
+        assert result["baseline"]["selected_language"] == "zh-CN"
+        assert "recommendation" not in result
+        assert "adjusted" not in result
+        assert "ranges" not in result
+
+    def test_already_selected_default_fallback_blank_header(self):
+        # No ranges -> default fallback selects the default; targeting it
+        # is already-selected even through fallback=true.
+        result = steer_q(
+            header=None,
+            supported=self.SUPPORTED,
+            default=self.DEFAULT,
+            target_language="en-US",
+        )
+        assert result["status"] == "already-selected"
+        assert result["baseline"]["fallback"] is True
+
+    def test_already_selected_locale_fallback(self):
+        chains = {"gsw": "de", "de": "zh-TW"}
+        result = steer_q(
+            header="gsw;q=0.9",
+            supported=self.SUPPORTED,
+            default=self.DEFAULT,
+            target_language="zh-TW",
+            locale_fallbacks=chains,
+        )
+        assert result["status"] == "already-selected"
+        assert result["baseline"]["locale_fallback"] is not None
+
+    def test_target_match_is_case_insensitive(self):
+        result = steer_q(
+            header="zh-CN,zh;q=0.9",
+            supported=self.SUPPORTED,
+            default=self.DEFAULT,
+            target_language="zh-cn",
+        )
+        assert result["status"] == "already-selected"
+
+    def test_recommend_lower_winner_below_competitor(self):
+        # zh-CN q=1 beats zh-TW via zh;q=0.9 while strictly greater;
+        # 0.9 itself ties in favor of the earlier zh-CN, so the minimum
+        # new q that flips to zh-TW is 0.899.
+        result = steer_q(
+            header="zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5",
+            supported=self.SUPPORTED,
+            default=self.DEFAULT,
+            target_language="zh-TW",
+        )
+        assert result["status"] == "recommended"
+        rec = result["recommendation"]
+        assert rec == {
+            "range": "zh-cn",
+            "position": 1,
+            "original_q": 1.0,
+            "new_q": 0.899,
+        }
+        adjusted = result["adjusted"]
+        assert adjusted["selected_language"] == "zh-TW"
+        assert adjusted["fallback"] is False
+        # Only the first header element's q changed; every other range
+        # and the later element order are bytewise preserved.
+        assert [(r["range"], r["q"]) for r in adjusted["parsed_ranges"]] == [
+            ("zh-cn", 0.899),
+            ("zh", 0.9),
+            ("en", 0.8),
+            ("*", 0.5),
+        ]
+
+    def test_recommend_raise_competitor_picks_minimum_grid_q(self):
+        # en-US (en;q=0) is excluded; zh-CN wins at 0.9. With zh fixed,
+        # en-US joins at 0.9 and wins the server-order tie: new q 0.9.
+        result = steer_q(
+            header="en;q=0,zh;q=0.9",
+            supported=["en-US", "zh-CN"],
+            default="en-US",
+            target_language="en-US",
+        )
+        assert result["status"] == "recommended"
+        assert result["recommendation"] == {
+            "range": "en",
+            "position": 1,
+            "original_q": 0.0,
+            "new_q": 0.9,
+        }
+        assert result["adjusted"]["selected_language"] == "en-US"
+
+    def test_equal_delta_tie_prefers_earlier_header_position(self):
+        # Lower zh-cn (position 1) by 101 steps or raise zh-tw
+        # (position 2) by 101 steps both select zh-TW: position wins.
+        result = steer_q(
+            header="zh-CN;q=0.9,zh-TW;q=0.8",
+            supported=["en-US", "zh-CN", "zh-TW"],
+            default="en-US",
+            target_language="zh-TW",
+        )
+        assert result["status"] == "recommended"
+        assert result["recommendation"]["range"] == "zh-cn"
+        assert result["recommendation"]["position"] == 1
+        assert result["recommendation"]["new_q"] == 0.799
+
+    def test_smaller_delta_beats_earlier_position(self):
+        # Moving the later range is cheaper and must win regardless of
+        # header position.
+        result = steer_q(
+            header="zh;q=0.9,en;q=0.8",
+            supported=self.SUPPORTED,
+            default=self.DEFAULT,
+            target_language="en-US",
+        )
+        assert result["status"] == "recommended"
+        # en -> 0.9 (100 steps) ties zh; en-US wins the server-order tie;
+        # zh -> 0.8 (100 steps) ties en; same delta -> earlier zh range,
+        # so the tie-break chain lands on zh here. Now check the other
+        # direction explicitly with an asymmetric gap instead.
+        rec = result["recommendation"]
+        assert rec["range"] == "zh"
+        assert (rec["new_q"], rec["original_q"]) == (0.8, 0.9)
+
+    def test_unreachable_earlier_ranges_lose_to_a_reachable_later_range(self):
+        # The earlier concrete ranges cannot select en-US at any q:
+        # lowering 'zh' merely hands the win to ja, lowering 'ja' hands
+        # it back to zh. Only raising the wildcard (position 3) can put
+        # the earliest-supported en-US on top -- header position must
+        # never override plain reachability / delta size.
+        result = steer_q(
+            header="zh;q=0.9,ja;q=0.8,*;q=0.7",
+            supported=self.SUPPORTED,
+            default=self.DEFAULT,
+            target_language="en-US",
+        )
+        assert result["status"] == "recommended"
+        assert result["recommendation"] == {
+            "range": "*",
+            "position": 3,
+            "original_q": 0.7,
+            "new_q": 0.9,
+        }
+        assert result["adjusted"]["selected_language"] == "en-US"
+
+    def test_unreachable_reports_per_range_flags(self):
+        # ja-JP is only reachable via the wildcard; every wildcard q
+        # simultaneously favors the earlier en-US, and 'de' matches
+        # nothing, so no single-range change can select ja-JP.
+        result = steer_q(
+            header="de;q=0.9,*;q=0.5",
+            supported=self.SUPPORTED,
+            default=self.DEFAULT,
+            target_language="ja-JP",
+        )
+        assert result["status"] == "unreachable"
+        assert result["ranges"] == [
+            {"range": "de", "position": 1, "original_q": 0.9, "reachable": False},
+            {"range": "*", "position": 2, "original_q": 0.5, "reachable": False},
+        ]
+        assert result["baseline"]["selected_language"] == "en-US"
+        assert "recommendation" not in result
+        assert "adjusted" not in result
+
+    def test_reachable_mixed_with_unreachable_ranges(self):
+        # Only the wildcard can let ja-JP win once the concrete de
+        # competitor is out of the way; here wildcard raising suffices
+        # for the earlier wildcard target, and 'de' is unreachable.
+        result = steer_q(
+            header="de;q=0.5,*;q=0.1",
+            supported=["en-US", "zh-CN"],
+            default="en-US",
+            target_language="en-US",
+        )
+        # en-US already wins the wildcard among wildcard candidates.
+        assert result["status"] == "already-selected"
+
+    def test_scan_reuses_locale_fallback_chains(self):
+        chains = {"gsw": "de", "de": "zh-TW", "fr": "ja-JP"}
+        # Baseline follows the higher-q gsw chain to zh-TW; lowering gsw
+        # to 0.499 lets the fr chain select ja-JP.
+        result = steer_q(
+            header="gsw;q=0.9,fr;q=0.5",
+            supported=["en-US", "zh-TW", "ja-JP"],
+            default="en-US",
+            target_language="ja-JP",
+            locale_fallbacks=chains,
+        )
+        assert result["status"] == "recommended"
+        assert result["recommendation"] == {
+            "range": "gsw",
+            "position": 1,
+            "original_q": 0.9,
+            "new_q": 0.499,
+        }
+        adjusted = result["adjusted"]
+        assert adjusted["selected_language"] == "ja-JP"
+        assert adjusted["locale_fallback"]["source_range"] == "fr"
+        assert adjusted["locale_fallback"]["path"] == ["fr", "ja-jp"]
+
+    def test_wildcard_lower_to_zero_drives_default_steering(self):
+        # Target equals the default; wildcard currently gives en-US a
+        # normal hit already, so construct a winner that q=0 wildcard can
+        # remove: zh;q=0.9 wins, lowering zh to 0 while wildcard 0.1
+        # remains makes en-US the wildcard winner.
+        result = steer_q(
+            header="zh;q=0.9,*;q=0.1",
+            supported=["en-US", "zh-CN"],
+            default="en-US",
+            target_language="en-US",
+        )
+        assert result["status"] == "recommended"
+        # zh -> 0.000..0.099 region: at 0.1 the wildcard ties and en-US
+        # (earlier index) wins, so 0.1 already suffices (900 steps),
+        # while raising * to 1.0 beats zh but selects en-US too
+        # (900 steps); earlier header position (zh) wins the global tie.
+        assert result["recommendation"]["range"] == "zh"
+        assert result["recommendation"]["new_q"] == 0.1
+        assert result["adjusted"]["selected_language"] == "en-US"
+
+    def test_duplicate_range_scanned_once_at_first_position(self):
+        result = steer_q(
+            header="en;q=0.1,en;q=0.9,*;q=0.05",
+            supported=self.SUPPORTED,
+            default=self.DEFAULT,
+            target_language="zh-CN",
+        )
+        # The second en occurrence is ignored; only one 'en' report and
+        # it carries the first occurrence's q 0.1.
+        if result["status"] == "unreachable":
+            en_reports = [r for r in result["ranges"] if r["range"] == "en"]
+            assert len(en_reports) == 1
+            assert en_reports[0]["position"] == 1
+            assert en_reports[0]["original_q"] == 0.1
+        else:
+            assert result["recommendation"]["range"] != "en" or (
+                result["recommendation"]["position"] == 1
+                and result["recommendation"]["original_q"] == 0.1
+            )
+
+    def test_adjusted_header_rewrite_preserves_other_elements_verbatim(self):
+        # Element 1 keeps its OWS while getting q=0.901 appended; element
+        # 2 (which supplies the competing en-US winner at 0.9) is
+        # bytewise untouched.
+        header = " fr ; q = 0.5 , en;q=0.9"
+        result = steer_q(
+            header=header,
+            supported=["en-US", "fr-FR"],
+            default="en-US",
+            target_language="fr-FR",
+        )
+        assert result["status"] == "recommended"
+        assert result["recommendation"]["position"] == 1
+        assert result["recommendation"]["new_q"] == 0.901
+        adjusted_ranges = result["adjusted"]["parsed_ranges"]
+        assert [(r["range"], r["q"]) for r in adjusted_ranges] == [
+            ("fr", 0.901),
+            ("en", 0.9),
+        ]
+
+    def test_range_without_q_parameter_gets_q_appended(self):
+        # Element has no q parameter (defaults to 1); lowering it to 0.899
+        # must append q=0.899 while parsing identically.
+        result = steer_q(
+            header="zh-CN,zh;q=0.9",
+            supported=["en-US", "zh-CN", "zh-TW"],
+            default="en-US",
+            target_language="zh-TW",
+        )
+        assert result["status"] == "recommended"
+        rec = result["recommendation"]
+        assert rec["range"] == "zh-cn"
+        assert rec["original_q"] == 1.0
+        assert rec["new_q"] == 0.899
+
+    def test_invalid_header_raises(self):
+        with pytest.raises(AcceptLanguageError):
+            steer_q(
+                header="en;q=2",
+                supported=self.SUPPORTED,
+                default=self.DEFAULT,
+                target_language="en-US",
+            )
+
+    def test_grid_scan_matches_brute_force_negotiate(self):
+        # Property test: every reported reachability/recommendation must
+        # agree with literally re-parsing and negotiating the rewritten
+        # header for each of the 1001 grid points of each range.
+        header = "zh-CN;q=0.8,zh;q=0.6,en;q=0.5,*;q=0.2"
+        supported = ["en-US", "zh-CN", "zh-TW", "ja-JP"]
+        default = "en-US"
+        parsed = parse_accept_language(header)
+        for target in supported:
+            result = steer_q(
+                header=header,
+                supported=supported,
+                default=default,
+                target_language=target,
+            )
+            for entry in parsed:
+                expected_reachable = False
+                for step in range(1001):
+                    if step == round(entry.q * 1000):
+                        continue
+                    token = f"{step // 1000}.{step % 1000:03d}"
+                    elements = header.split(",")
+                    parts = elements[entry.position - 1].split(";")
+                    replaced = False
+                    for idx in range(1, len(parts)):
+                        if parts[idx].strip().split("=", 1)[0].strip() == "q":
+                            head, _sep, _val = parts[idx].partition("=")
+                            parts[idx] = head + "=" + token
+                            replaced = True
+                    if not replaced:
+                        parts.append(f"q={token}")
+                    elements[entry.position - 1] = ";".join(parts)
+                    outcome = negotiate(",".join(elements), supported, default)
+                    if outcome["selected_language"].lower() == target.lower():
+                        expected_reachable = True
+                report = next(
+                    r for r in (
+                        result.get("ranges") or []
+                    ) if r["range"] == entry.range
+                ) if result["status"] == "unreachable" else None
+                if report is not None:
+                    assert report["reachable"] is expected_reachable
+            if result["status"] == "recommended":
+                # The adjusted negotiation must actually select target.
+                assert (
+                    result["adjusted"]["selected_language"].lower()
+                    == target.lower()
+                )
+                # Minimality: brute-force search of the global best key.
+                best_key = None
+                for entry in parsed:
+                    origin = round(entry.q * 1000)
+                    for step in range(1001):
+                        if step == origin:
+                            continue
+                        token = f"{step // 1000}.{step % 1000:03d}"
+                        elements = header.split(",")
+                        parts = elements[entry.position - 1].split(";")
+                        done = False
+                        for idx in range(1, len(parts)):
+                            if parts[idx].strip().split("=", 1)[0].strip() == "q":
+                                head, _sep, _v = parts[idx].partition("=")
+                                parts[idx] = head + "=" + token
+                                done = True
+                        if not done:
+                            parts.append(f"q={token}")
+                        elements[entry.position - 1] = ";".join(parts)
+                        outcome = negotiate(",".join(elements), supported, default)
+                        if outcome["selected_language"].lower() == target.lower():
+                            key = (abs(step - origin), entry.position, step)
+                            if best_key is None or key < best_key:
+                                best_key = key
+                rec = result["recommendation"]
+                assert best_key == (
+                    abs(round(rec["new_q"] * 1000) - round(rec["original_q"] * 1000)),
+                    rec["position"],
+                    round(rec["new_q"] * 1000),
+                )

@@ -15,6 +15,11 @@ traffic 的 `Accept-Language` 流量样本与 1～12 个候选新增语言，穷
 请求体与单人协商完全相同，服务端先给出基准协商结果，再对去重后的每个语言范围单独
 扫描 RFC 允许的 `0.000`～`1.000` 三位小数 q 网格，求出保持 `selected_language` 与
 `fallback` 状态均不变的最大连续区间，并报告越过边界后会得到什么结果。
+`/api/v1/negotiate/q-steer` 提供**目标语言 q 引导**：在单人协商请求体上增加一个
+必须属于 `supported_languages` 的 `target_language`，服务端先给出基准协商结果，
+再对去重后的每个语言范围分别扫描 `0.000`～`1.000` 三位小数 q 网格（其余范围保持
+不变），找出能让目标语言胜出的**最小单项 q 改动**（全局按改变量、头部顺序、较低
+新 q 依次决胜），或判定目标已命中 / 任何单项改动都不可达。
 
 技术栈：Python 3.12 · FastAPI · Pydantic v2 · Uvicorn，依赖在容器构建时安装。
 
@@ -31,6 +36,7 @@ docker compose up -d --build
 | http://localhost:8000/health | 健康检查（`GET`，返回 `{"status":"ok"}`） |
 | http://localhost:8000/api/v1/negotiate | 语言协商接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/q-stability | 偏好权重稳定区间分析接口（`POST`） |
+| http://localhost:8000/api/v1/negotiate/q-steer | 目标语言最小单项 q 改动引导接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/group | 群体语言协商接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/coverage-plan | 候选语言覆盖规划接口（`POST`） |
 | http://localhost:8000/docs | Swagger UI 交互式文档 |
@@ -316,6 +322,125 @@ curl -X POST http://localhost:8000/api/v1/negotiate/q-stability \
    **422** 结构（`loc` 为 `["body","accept_language"]`，`type` 为
    `accept_language.syntax_error`）。
 
+## 目标语言 q 引导（POST /api/v1/negotiate/q-steer）
+
+当希望某个**目标语言**成为协商赢家（例如引导用户接受一个推荐语言）时，使用 q 引导
+接口。请求体在单人协商请求基础上增加必填的 `target_language`（必须属于
+`supported_languages`，大小写不敏感）。服务端先按现有规则跑一次**基准协商**，再对
+**去重后的每个语言范围**分别扫描 RFC 9110 允许的 **`0.000`～`1.000` 三位小数 q
+网格**（共 1001 个点）：扫描某一范围时**其余范围（含重复出现、通配符）的原始 q 与
+拼写保持不变**，看该范围改到哪个网格点后目标语言能胜出，最后在全部范围的可行解中
+选出**最小单项改动**。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/negotiate/q-steer \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "accept_language": "zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5",
+    "supported_languages": ["en-US", "zh-CN", "zh-TW", "ja-JP"],
+    "default_language": "en-US",
+    "target_language": "zh-TW"
+  }'
+```
+
+基准协商选中 `zh-CN`；要让 `zh-TW`（经 `zh;q=0.9` 截断命中）胜出，把 `zh-CN` 的 q
+降到 `0.9` 仍会因同权重服务端顺序决胜而输，最小改动是降到 `0.899`。响应（节选）：
+
+```json
+{
+  "status": "recommended",
+  "baseline": {
+    "selected_language": "zh-CN",
+    "selected_supported_index": 1,
+    "fallback": false,
+    "fallback_reason": null
+  },
+  "recommendation": {
+    "range": "zh-cn",
+    "position": 1,
+    "original_q": 1.0,
+    "new_q": 0.899
+  },
+  "adjusted": {
+    "selected_language": "zh-TW",
+    "selected_supported_index": 2,
+    "fallback": false,
+    "fallback_reason": null,
+    "parsed_ranges": [
+      {"range": "zh-cn", "q": 0.899, "position": 1},
+      {"range": "zh", "q": 0.9, "position": 2},
+      {"range": "en", "q": 0.8, "position": 3},
+      {"range": "*", "q": 0.5, "position": 4}
+    ]
+  }
+}
+```
+
+### 三种 `status`
+
+| `status` | 含义 | 响应附加字段 |
+| --- | --- | --- |
+| `already-selected` | 基准协商**已经选中**目标语言（正常命中、`locale_fallbacks` 链命中或默认兜底均算） | 无 |
+| `recommended` | 至少一个范围的网格扫描能让目标胜出，已选出全局最小单项改动 | `recommendation`、`adjusted` |
+| `unreachable` | 任何单个范围改到任意合法网格点都无法让目标胜出 | `ranges`（逐范围可达性） |
+
+### `recommendation` / `adjusted`
+
+`recommendation` 给出要改的范围与新旧 q：
+
+| 字段 | 说明 |
+| --- | --- |
+| `range` | 去重后的语言范围（小写；可能为通配符 `*`） |
+| `position` | 该范围在原始 `Accept-Language` 头中的位置（从 1 开始，重复范围只保留第一次出现） |
+| `original_q` | 该范围原来的 q |
+| `new_q` | 建议调整到的 q（合法三位小数网格点，可升可降，也可降到 `0.000` 做 q=0 排除） |
+
+`adjusted` 是把**且仅把**该头部元素的 q 改写为 `new_q`（其余逗号分隔元素原样保留，
+无 q 参数的元素在原位追加）后重新协商的**完整结果**，结构与 `POST
+/api/v1/negotiate` 逐字段一致；`baseline` 同理。两处的 `locale_fallback` 键都遵循
+单人接口约定——链未触发时整体缺省，链触发时出现。
+
+### 全局决胜规则
+
+1. **改变量最小**：比较 `|new_q − original_q|`（按三位小数网格步数计），越小越优。
+2. **头部顺序更早**：改变量相同，取 `position` 更小的范围。
+3. **新 q 更低**：同一范围在网格上存在多个等距可行点时，取较低的 `new_q`。
+
+例如：把赢家范围降 101 步与把竞争范围升 101 步都可行时，取头部更靠前的范围；
+q=0 排除（把范围降到 `0.000` 从而淘汰当前赢家）同样作为普通网格点参与比较。
+
+### `unreachable` 的 `ranges`
+
+按头部顺序为去重后保留的每个范围（含 `*`）给出：
+
+```json
+{
+  "range": "de",
+  "position": 1,
+  "original_q": 0.9,
+  "reachable": false
+}
+```
+
+`reachable=true` 表示存在至少一个合法网格点，使该范围单独改 q 后目标胜出；全部为
+`false` 时整体判定为 `unreachable`（典型场景：目标语言只可能经通配符命中，而支持
+列表中更早的候选同样只经通配符命中，于是通配符的任何 q 都会被更早候选抢走）。
+
+### 语义复用与校验
+
+- 通配符 `*`、RFC 4647 逐级截断匹配、「具体范围优先于 `*`」「最长前缀命中」、
+  重复范围保留第一次出现、`q=0` 排除以及 `locale_fallbacks` 有向链全部**原样复用
+  `/negotiate` 的协商逻辑**：例如通过压低当前正 q 源范围让另一条链胜出，或把范围
+  降到 `0.000` 使其不再作为链的源，都会自然生效。
+- 基准经默认兜底选中目标语言（如请求头缺失且目标就是默认语言）时返回
+  `already-selected`；空头部不包含任何范围，`recommended`/`unreachable` 下不产生
+  范围记录。
+- 校验（均返回 **HTTP 422**）：`target_language` 缺失、不是合法 BCP 47 标签或不在
+  `supported_languages` 中（`loc` 为 `["body","target_language"]` / `["body"]`），
+  非法 `Accept-Language` 头（`loc` 为 `["body","accept_language"]`，`type` 为
+  `accept_language.syntax_error`），以及单人接口既有的
+  `supported_languages` / `default_language` / `locale_fallbacks` 校验。
+
 ## 群体协商（POST /api/v1/negotiate/group）
 
 当需要为一组用户（如同一会议、家庭账号）选出**共同可接受**的单一语言时，使用群体
@@ -567,7 +692,7 @@ docker run --rm -p 8000:8000 -e UVICORN_WORKERS=2 language-negotiator
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000
-pytest -q          # 142 个单元/接口测试
+pytest -q          # 171 个单元/接口测试
 ```
 
 ## 项目结构

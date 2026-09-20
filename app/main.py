@@ -14,6 +14,7 @@ from .negotiation import (
     negotiate,
     negotiate_group,
     plan_coverage,
+    steer_q,
 )
 from .schemas import (
     CoveragePlanRequest,
@@ -24,6 +25,8 @@ from .schemas import (
     NegotiationRequest,
     NegotiationResponse,
     QStabilityResponse,
+    QSteerRequest,
+    QSteerResponse,
 )
 app = FastAPI(
     title="HTTP 语言协商解释 API",
@@ -35,6 +38,9 @@ app = FastAPI(
         "另提供 /api/v1/negotiate/group 群体协商：对多位参与者逐人复用相同的"
         "匹配语义构成权重矩阵，具体范围 q=0 全局否决，按最低个人权重 → 总权重 → "
         "服务端顺序选出共同接受的语言。"
+        "/api/v1/negotiate/q-steer 则做反向引导：给定一个受支持的目标语言，"
+        "对去重后的每个范围分别扫描三位小数 q 网格（其余范围不变），"
+        "找出能让目标语言胜出的最小单项 q 改动。"
     ),
     version=__version__,
 )
@@ -173,6 +179,40 @@ async def negotiate_q_stability(
 
 
 @app.post(
+    "/api/v1/negotiate/q-steer",
+    response_model=QSteerResponse,
+    tags=["语言协商"],
+    summary="单范围最小 q 改动引导目标语言胜出",
+)
+async def negotiate_q_steer(payload: QSteerRequest) -> JSONResponse:
+    result = steer_q(
+        header=payload.accept_language,
+        supported=payload.supported_languages,
+        default=payload.default_language,
+        target_language=payload.target_language,
+        locale_fallbacks=payload.locale_fallbacks,
+    )
+
+    def _negotiation_body(section: dict) -> dict:
+        response = NegotiationResponse.model_validate(section)
+        if response.locale_fallback is None:
+            # Match /negotiate: the key is dropped rather than emitted null.
+            return response.model_dump(exclude={"locale_fallback"})
+        return response.model_dump()
+
+    body: dict = {
+        "status": result["status"],
+        "baseline": _negotiation_body(result["baseline"]),
+    }
+    if result["status"] == "recommended":
+        body["recommendation"] = result["recommendation"]
+        body["adjusted"] = _negotiation_body(result["adjusted"])
+    elif result["status"] == "unreachable":
+        body["ranges"] = result["ranges"]
+    return JSONResponse(content=body)
+
+
+@app.post(
     "/api/v1/negotiate/group",
     response_model=GroupNegotiationResponse,
     tags=["语言协商"],
@@ -217,5 +257,6 @@ async def root() -> dict[str, str]:
         "health": "/health",
         "negotiate": "POST /api/v1/negotiate",
         "negotiate_q_stability": "POST /api/v1/negotiate/q-stability",
+        "negotiate_q_steer": "POST /api/v1/negotiate/q-steer",
         "negotiate_group": "POST /api/v1/negotiate/group",
     }

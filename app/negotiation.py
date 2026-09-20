@@ -37,6 +37,12 @@ Implements the negotiation rules required by the service:
   ranges stay fixed, and reports the maximal contiguous grid interval
   around the original q that keeps ``selected_language`` and the
   fallback state unchanged.
+* :func:`steer_q` performs the inverse search: given a target language
+  from the supported list it scans the same three-decimal q grid for
+  each de-duplicated range individually (the other ranges fixed) and
+  reports the single smallest change that makes the target win,
+  breaking global ties by smaller |q change|, then earlier header
+  position, then lower resulting q.
 
 Language tag grammar follows RFC 5646 (BCP 47) primary tag grammar, which
 covers every ordinary language tag (the legacy "grandfathered" irregular
@@ -46,9 +52,9 @@ tags from the RFC registry are intentionally rejected).
 from __future__ import annotations
 
 import re
+from typing import Any, Callable
 from dataclasses import dataclass
 from itertools import combinations
-from typing import Any
 
 # RFC 9110 quality values carry at most three fractional digits, so the
 # legal q grid has 1001 points from 0.000 through 1.000 inclusive.
@@ -847,6 +853,129 @@ def plan_coverage(
     }
 
 
+def _build_grid_outcome(
+    parsed: list[LanguageRange],
+    supported: list[str],
+    default_index: int,
+    chains: dict[str, str],
+) -> Callable[[list[LanguageRange]], tuple[str, bool]]:
+    """Build a lightweight mirror of negotiate()'s selection decision.
+
+    Match resolution (concrete range vs wildcard vs nothing, truncation
+    prefixes, q=0 exclusion) depends only on the *tags*, never on q
+    values, so it is precomputed once per candidate; the returned
+    callable reads only the ranges' current q values -- no header is
+    re-parsed -- and mirrors negotiate(): winner by q then server order,
+    then the locale_fallbacks chain, then the default fallback. Shared
+    by analyze_q_stability() and steer_q() so both grid scans apply the
+    exact same rules as negotiate().
+    """
+
+    # Per candidate, the effective range depends solely on the tags:
+    # (matched concrete entry or None, wildcard entry or None). Same
+    # precedence as negotiate(): concrete longest-prefix match beats *.
+    candidate_effective: list[
+        tuple[LanguageRange | None, LanguageRange | None]
+    ] = []
+    for candidate in supported:
+        chain = truncation_chain(candidate)
+        matched, _prefix = _find_concrete_range(chain, parsed)
+        wildcard = _wildcard_range(parsed) if matched is None else None
+        candidate_effective.append((matched, wildcard))
+
+    supported_lower_to_index = {
+        tag.lower(): index for index, tag in enumerate(supported)
+    }
+
+    def outcome(ranges: list[LanguageRange]) -> tuple[str, bool]:
+        q_by_range = {entry.range: entry.q for entry in ranges}
+        eligible: list[tuple[float, int]] = []
+        for index, (matched, wildcard) in enumerate(candidate_effective):
+            if matched is not None:
+                q_value = q_by_range[matched.range]
+            elif wildcard is not None:
+                q_value = q_by_range["*"]
+            else:
+                continue
+            if q_value > 0:
+                eligible.append((q_value, index))
+            # q == 0 -> excluded, exactly like negotiate(): wildcard and
+            # concrete exclusions both keep the candidate out of the set.
+
+        selected_index: int | None = None
+        if eligible:
+            _q, selected_index = min(
+                eligible, key=lambda item: (-item[0], item[1])
+            )
+        elif chains:
+            zero_concrete = {
+                entry.range
+                for entry in ranges
+                if entry.range != "*" and entry.q == 0
+            }
+            positive = [
+                entry
+                for entry in ranges
+                if entry.range != "*" and entry.q > 0 and entry.range in chains
+            ]
+            positive.sort(key=lambda entry: (-entry.q, entry.position))
+            for source in positive:
+                visited: set[str] = {source.range}
+                node = source.range
+                while True:
+                    index = supported_lower_to_index.get(node)
+                    if index is not None:
+                        if (
+                            _concrete_q_zero_excluded(
+                                node, list(zero_concrete)
+                            )
+                            is None
+                        ):
+                            selected_index = index
+                            break
+                        # Supported but explicitly excluded: keep walking,
+                        # mirroring _chain_fallback.
+                    nxt = chains.get(node)
+                    if nxt is None or nxt in visited:
+                        break
+                    visited.add(nxt)
+                    node = nxt
+                if selected_index is not None:
+                    break
+
+        if selected_index is None:
+            return supported[default_index], True
+        return supported[selected_index], False
+
+    return outcome
+
+
+def _rewrite_range_q(header: str, position: int, q: float) -> str:
+    """Rewrite one comma-separated header element's q value in place.
+
+    The element at 1-based ``position`` keeps its raw tag spelling and
+    OWS; an existing ``q`` parameter is replaced at its original
+    location (multiple parameters keep their order), or ``q=<q>`` is
+    appended when the element has none. Every other element is returned
+    verbatim, mirroring the brute-force rewrites used by the q-stability
+    property tests.
+    """
+
+    elements = header.split(",")
+    parts = elements[position - 1].split(";")
+    token = f"{q:.3f}"
+    replaced = False
+    for idx in range(1, len(parts)):
+        if parts[idx].strip().split("=", 1)[0].strip() == "q":
+            head, _sep, _value = parts[idx].partition("=")
+            parts[idx] = head + "=" + token
+            replaced = True
+    if not replaced:
+        parts.append(f"q={token}")
+    elements[position - 1] = ";".join(parts)
+    return ",".join(elements)
+
+
 def analyze_q_stability(
     header: str | None,
     supported: list[str],
@@ -892,82 +1021,8 @@ def analyze_q_stability(
         if locale_fallbacks
         else {}
     )
-    supported_lower_to_index = {
-        tag.lower(): index for index, tag in enumerate(supported)
-    }
     default_index = _default_supported_index(supported, default)
-
-    # Per candidate, the effective range depends solely on the tags:
-    # (matched concrete entry or None, wildcard entry or None). Same
-    # precedence as negotiate(): concrete longest-prefix match beats *.
-    candidate_effective: list[tuple[LanguageRange | None, LanguageRange | None]] = []
-    for candidate in supported:
-        chain = truncation_chain(candidate)
-        matched, _prefix = _find_concrete_range(chain, parsed)
-        wildcard = _wildcard_range(parsed) if matched is None else None
-        candidate_effective.append((matched, wildcard))
-
-    def outcome(
-        ranges: list[LanguageRange],
-    ) -> tuple[str, bool]:
-        """Mirror of negotiate()'s winner/fallback decision on ranges."""
-
-        q_by_range = {entry.range: entry.q for entry in ranges}
-        eligible: list[tuple[float, int]] = []
-        for index, (matched, wildcard) in enumerate(candidate_effective):
-            if matched is not None:
-                q_value = q_by_range[matched.range]
-            elif wildcard is not None:
-                q_value = q_by_range["*"]
-            else:
-                continue
-            if q_value > 0:
-                eligible.append((q_value, index))
-            # q == 0 -> excluded, exactly like negotiate(): wildcard and
-            # concrete exclusions both keep the candidate out of the set.
-
-        selected_index: int | None = None
-        if eligible:
-            _q, selected_index = min(
-                eligible, key=lambda item: (-item[0], item[1])
-            )
-        elif chains:
-            zero_concrete = {
-                entry.range
-                for entry in ranges
-                if entry.range != "*" and entry.q == 0
-            }
-            positive = [
-                entry
-                for entry in ranges
-                if entry.range != "*" and entry.q > 0 and entry.range in chains
-            ]
-            positive.sort(key=lambda entry: (-entry.q, entry.position))
-            for source in positive:
-                visited: set[str] = {source.range}
-                node = source.range
-                while True:
-                    index = supported_lower_to_index.get(node)
-                    if index is not None:
-                        if (
-                            _concrete_q_zero_excluded(node, list(zero_concrete))
-                            is None
-                        ):
-                            selected_index = index
-                            break
-                        # Supported but explicitly excluded: keep walking,
-                        # mirroring _chain_fallback.
-                    nxt = chains.get(node)
-                    if nxt is None or nxt in visited:
-                        break
-                    visited.add(nxt)
-                    node = nxt
-                if selected_index is not None:
-                    break
-
-        if selected_index is None:
-            return supported[default_index], True
-        return supported[selected_index], False
+    outcome = _build_grid_outcome(parsed, supported, default_index, chains)
 
     def outcome_with_q(target: LanguageRange, q: float) -> tuple[str, bool]:
         varied = LanguageRange(
@@ -1056,3 +1111,123 @@ def analyze_q_stability(
         )
 
     return {"baseline": baseline, "ranges": range_reports}
+
+
+def steer_q(
+    header: str | None,
+    supported: list[str],
+    default: str,
+    target_language: str,
+    locale_fallbacks: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Find the smallest single-range q change that makes a target win.
+
+    The request schema guarantees ``target_language`` is one of
+    ``supported`` (case-insensitive). A baseline run via
+    :func:`negotiate` decides the immediate cases:
+
+    * ``already-selected`` -- the baseline already selects the target
+      (whether by normal lookup, a locale_fallbacks chain or the default
+      fallback);
+    * ``recommended`` -- for at least one de-duplicated range some point
+      of the ``0.000``..``1.000`` three-decimal q grid (the other ranges
+      kept fixed) makes the target win; the globally smallest change is
+      recommended, ties broken by smaller absolute q delta, then earlier
+      header position, then lower resulting q;
+    * ``unreachable`` -- no range's grid scan can select the target;
+      per-range reachability is reported in header order.
+
+    The grid scan uses the same precomputed-match mirror as
+    :func:`analyze_q_stability`; the adjusted result is a full
+    :func:`negotiate` run against a header whose chosen element is
+    rewritten in place (other elements, duplicate occurrences and
+    spacing untouched), so wildcards, truncation matching, q=0
+    exclusion and locale_fallbacks chains are all reused verbatim.
+    """
+
+    chains = (
+        {source.lower(): target.lower() for source, target in locale_fallbacks.items()}
+        if locale_fallbacks
+        else {}
+    )
+
+    baseline = negotiate(
+        header=header,
+        supported=supported,
+        default=default,
+        locale_fallbacks=locale_fallbacks,
+    )
+    parsed = parse_accept_language(header)
+
+    target_lower = target_language.lower()
+    if baseline["selected_language"].lower() == target_lower:
+        return {"status": "already-selected", "baseline": baseline}
+
+    default_index = _default_supported_index(supported, default)
+    outcome = _build_grid_outcome(parsed, supported, default_index, chains)
+
+    # Best candidate key: (|delta steps|, header position, new step).
+    best: tuple[int, int, int, LanguageRange] | None = None
+    reachable: list[dict[str, Any]] = []
+    for entry in parsed:
+        original_step = round(entry.q * Q_GRID_STEPS)
+        range_reachable = False
+        for step in range(Q_GRID_STEPS + 1):
+            if step == original_step:
+                # The baseline at the original q does not select the
+                # target, so this point never qualifies.
+                continue
+            varied = LanguageRange(
+                range=entry.range,
+                q=step / Q_GRID_STEPS,
+                position=entry.position,
+            )
+            ranges = [
+                varied if other is entry else other for other in parsed
+            ]
+            selected, _fell_back = outcome(ranges)
+            if selected.lower() != target_lower:
+                continue
+            range_reachable = True
+            candidate = (abs(step - original_step), entry.position, step, entry)
+            if best is None or candidate[:3] < best[:3]:
+                best = candidate
+        reachable.append(
+            {
+                "range": entry.range,
+                "position": entry.position,
+                "original_q": entry.q,
+                "reachable": range_reachable,
+            }
+        )
+
+    if best is None:
+        return {
+            "status": "unreachable",
+            "baseline": baseline,
+            "ranges": reachable,
+        }
+
+    _delta, _position, new_step, target_entry = best
+    new_q = new_step / Q_GRID_STEPS
+    adjusted_header = _rewrite_range_q(
+        header if header is not None else "", target_entry.position, new_q
+    )
+    adjusted = negotiate(
+        header=adjusted_header,
+        supported=supported,
+        default=default,
+        locale_fallbacks=locale_fallbacks,
+    )
+    recommendation = {
+        "range": target_entry.range,
+        "position": target_entry.position,
+        "original_q": target_entry.q,
+        "new_q": new_q,
+    }
+    return {
+        "status": "recommended",
+        "baseline": baseline,
+        "recommendation": recommendation,
+        "adjusted": adjusted,
+    }

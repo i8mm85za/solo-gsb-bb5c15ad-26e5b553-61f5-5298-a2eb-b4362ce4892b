@@ -225,6 +225,83 @@ class QStabilityResponse(BaseModel):
     )
 
 
+class QSteerRequest(NegotiationRequest):
+    """Single-range q steering input.
+
+    Identical to :class:`NegotiationRequest` plus ``target_language``,
+    which must be one of ``supported_languages`` (case-insensitive).
+    """
+
+    target_language: str = Field(
+        title="希望通过调整单个范围 q 而胜出的目标语言",
+        description="必须包含在 supported_languages 中（大小写不敏感）",
+    )
+
+    @field_validator("target_language")
+    @classmethod
+    def _validate_target(cls, value: str) -> str:
+        return _check_default_tag(value)
+
+    @model_validator(mode="after")
+    def _target_must_be_supported(self) -> "QSteerRequest":
+        supported_lower = {tag.lower() for tag in self.supported_languages}
+        if self.target_language.lower() not in supported_lower:
+            raise ValueError(
+                "target_language 必须包含在 supported_languages 中（大小写不敏感）"
+            )
+        return self
+
+
+class QSteerRecommendation(BaseModel):
+    """The single smallest range/q change that makes the target win."""
+
+    range: str = Field(description="需要调整的去重后语言范围（小写；可能为 '*'）")
+    position: int = Field(description="该范围在原始 Accept-Language 头中的位置（从 1 开始）")
+    original_q: float = Field(description="该范围原来的 q")
+    new_q: float = Field(
+        description=(
+            "建议调整到的 q（三位小数网格点）；为全局改变量最小、"
+            "同改变量头部顺序最早、同位置新 q 最低的胜出方案"
+        )
+    )
+
+
+class QSteerRangeReachability(BaseModel):
+    """Whether scanning one de-duplicated range's q grid can reach the target."""
+
+    range: str = Field(description="去重后的语言范围（小写；可能为 '*'）")
+    position: int = Field(description="该范围在原始 Accept-Language 头中的位置（从 1 开始）")
+    original_q: float = Field(description="该范围原来的 q")
+    reachable: bool = Field(
+        description="仅把该范围的 q 改到 0.000～1.000 网格上某点，目标语言是否能胜出"
+    )
+
+
+class QSteerResponse(BaseModel):
+    status: Literal["already-selected", "recommended", "unreachable"] = Field(
+        description=(
+            "already-selected：基准协商已选中目标语言；"
+            "recommended：找到让目标胜出的最小单项 q 改动；"
+            "unreachable：任何单个范围的网格扫描都无法让目标胜出"
+        )
+    )
+    baseline: NegotiationResponse = Field(
+        description="按现有规则得到的基准单人协商结果（与 /negotiate 完全一致）"
+    )
+    recommendation: QSteerRecommendation | None = Field(
+        default=None,
+        description="status=recommended 时给出：范围、位置、原 q、新 q",
+    )
+    adjusted: NegotiationResponse | None = Field(
+        default=None,
+        description="status=recommended 时按建议改动后重新协商的完整结果",
+    )
+    ranges: list[QSteerRangeReachability] | None = Field(
+        default=None,
+        description="status=unreachable 时按头部顺序列出各去重范围是否可达目标",
+    )
+
+
 class GroupParticipant(BaseModel):
     """One group member: a unique id plus their raw Accept-Language header."""
 
