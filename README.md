@@ -15,6 +15,10 @@ traffic 的 `Accept-Language` 流量样本与 1～12 个候选新增语言，穷
 请求体与单人协商完全相同，服务端先给出基准协商结果，再对去重后的每个语言范围单独
 扫描 RFC 允许的 `0.000`～`1.000` 三位小数 q 网格，求出保持 `selected_language` 与
 `fallback` 状态均不变的最大连续区间，并报告越过边界后会得到什么结果。
+`/api/v1/negotiate/q-steer` 提供**目标语言引导**：在单人协商请求上增加
+`target_language`，服务端同样逐范围扫描三位小数 q 网格，找出让目标语言胜出的
+**最小单项 q 改动**（按改变量、头部顺序、较低新 q 依次决胜），并给出基准与调整后的
+完整协商结果。
 
 技术栈：Python 3.12 · FastAPI · Pydantic v2 · Uvicorn，依赖在容器构建时安装。
 
@@ -31,6 +35,7 @@ docker compose up -d --build
 | http://localhost:8000/health | 健康检查（`GET`，返回 `{"status":"ok"}`） |
 | http://localhost:8000/api/v1/negotiate | 语言协商接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/q-stability | 偏好权重稳定区间分析接口（`POST`） |
+| http://localhost:8000/api/v1/negotiate/q-steer | 目标语言引导接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/group | 群体语言协商接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/coverage-plan | 候选语言覆盖规划接口（`POST`） |
 | http://localhost:8000/docs | Swagger UI 交互式文档 |
@@ -316,6 +321,79 @@ curl -X POST http://localhost:8000/api/v1/negotiate/q-stability \
    **422** 结构（`loc` 为 `["body","accept_language"]`，`type` 为
    `accept_language.syntax_error`）。
 
+## 目标语言引导（POST /api/v1/negotiate/q-steer）
+
+当需要回答「最少改动哪个语言范围的 q，就能让指定语言被选中？」时（例如引导客户端
+偏好、评估某个语言上线所需的最小权重），使用目标引导接口。请求体在单人协商的基础
+上增加必填的 `target_language`（必须包含在 `supported_languages` 中，大小写不
+敏感）。服务端先按现有规则跑一次基准协商，再对**去重后的每个语言范围**单独扫描
+`0.000`～`1.000` 三位小数 q 网格（扫描某一范围时其余范围保持原 q 不变），找出能
+让目标语言成为 `selected_language` 的**最小单项改动**。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/negotiate/q-steer \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "accept_language": "zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5",
+    "supported_languages": ["en-US", "zh-CN", "zh-TW", "ja-JP"],
+    "default_language": "en-US",
+    "target_language": "zh-TW"
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "status": "recommended",
+  "target_language": "zh-TW",
+  "baseline": {"selected_language": "zh-CN", "fallback": false},
+  "adjusted": {"selected_language": "zh-TW", "fallback": false},
+  "recommendation": {"range": "zh-cn", "position": 1, "original_q": 1.0, "new_q": 0.899},
+  "ranges": null
+}
+```
+
+上例中基准选中 `zh-CN`（`zh-cn` 范围 q=1.0）；把 `zh-cn` 的 q 降到 `0.899` 后，
+`zh-TW`（经 `zh;q=0.9` 命中）即以 0.9 对 0.899 胜出——这是全局改变量最小的单项
+改动。
+
+### 目标引导请求体
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `accept_language` | string \| null | 否 | 与单人接口相同 |
+| `supported_languages` | string[] | 是 | 与单人接口相同（顺序即稳定优先级） |
+| `default_language` | string | 是 | 与单人接口相同（必须在支持列表中） |
+| `locale_fallbacks` | object<string,string> \| null | 否 | 与单人接口相同 |
+| `target_language` | string | 是 | 目标语言，必须包含在 `supported_languages` 中（大小写不敏感） |
+
+### 引导规则与响应字段
+
+1. **基准优先**：先按未改动的请求协商一次。基准的 `selected_language` 已是目标
+   语言时返回 `status: "already-selected"`，`adjusted` 与 `baseline` 相同，
+   `recommendation` 与 `ranges` 为 `null`（目标经默认兜底选中也算已命中）。
+2. **最小单项改动**：否则逐范围扫描 q 网格（其余范围原样保留），收集所有能让
+   `selected_language` 变为目标语言的「范围 × 新 q」组合，按
+   **改变量 `|新q − 原q|` → 头部顺序 → 较低新 q** 依次决胜，返回
+   `status: "recommended"` 与 `recommendation`（`range`、`position`、
+   `original_q`、`new_q`）。`adjusted` 是只把该范围头部元素的 q 改为 `new_q`
+   后重新协商的**完整结果**（结构与 `/negotiate` 一致）。
+3. **不可达**：任何单项改动都无法选中目标语言时返回 `status: "unreachable"`，
+   `adjusted` 与 `recommendation` 为 `null`，`ranges` 按头部顺序列出每个去重
+   范围（含通配符）的 `reachable`（均为 `false`）；请求头无有效范围时
+   `ranges` 为空数组。
+4. **语义复用**：通配符、RFC 4647 逐级截断、`q=0` 排除（`0.000` 是合法的新 q，
+   可用于排除某个范围）与 `locale_fallbacks` 链全部原样复用 `/negotiate` 的
+   协商逻辑；目标语言经**默认兜底**被选中同样视为命中（此时
+   `adjusted.fallback` 为 `true`）。
+5. **校验**：`target_language` 非法或不在 `supported_languages` 中返回
+   **422**（`loc` 为 `["body","target_language"]`）；其余校验与单人接口一致。
+
+响应公共字段：`status`（`already-selected` / `recommended` / `unreachable`）、
+`target_language`（回显 `supported_languages` 中的服务端原始大小写）、`baseline`
+（基准协商结果，`locale_fallback` 同样仅在链实际触发时出现）。
+
 ## 群体协商（POST /api/v1/negotiate/group）
 
 当需要为一组用户（如同一会议、家庭账号）选出**共同可接受**的单一语言时，使用群体
@@ -567,7 +645,7 @@ docker run --rm -p 8000:8000 -e UVICORN_WORKERS=2 language-negotiator
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000
-pytest -q          # 142 个单元/接口测试
+pytest -q          # 172 个单元/接口测试
 ```
 
 ## 项目结构

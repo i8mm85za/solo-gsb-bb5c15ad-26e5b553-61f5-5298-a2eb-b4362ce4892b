@@ -445,6 +445,188 @@ def test_q_stability_extra_field_rejected_422():
     assert response.status_code == 422
 
 
+def _post_q_steer(payload):
+    return client.post("/api/v1/negotiate/q-steer", json=payload)
+
+
+def test_q_steer_recommended():
+    response = _post_q_steer(
+        {
+            "accept_language": "zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "target_language": "zh-TW",
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "recommended"
+    assert body["target_language"] == "zh-TW"
+    assert body["baseline"]["selected_language"] == "zh-CN"
+    assert "locale_fallback" not in body["baseline"]
+    # Lowering zh-CN's own range below zh;q=0.9 lets zh-TW win.
+    assert body["recommendation"] == {
+        "range": "zh-cn",
+        "position": 1,
+        "original_q": 1.0,
+        "new_q": 0.899,
+    }
+    assert body["adjusted"]["selected_language"] == "zh-TW"
+    assert body["adjusted"]["fallback"] is False
+    assert body["ranges"] is None
+
+
+def test_q_steer_already_selected():
+    response = _post_q_steer(
+        {
+            "accept_language": "zh-CN,zh;q=0.9",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            # Case-insensitive: the canonical server casing is echoed.
+            "target_language": "zh-cn",
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "already-selected"
+    assert body["target_language"] == "zh-CN"
+    assert body["adjusted"] == body["baseline"]
+    assert body["recommendation"] is None
+    assert body["ranges"] is None
+
+
+def test_q_steer_unreachable():
+    response = _post_q_steer(
+        {
+            "accept_language": "en,zh",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "target_language": "ja-JP",
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "unreachable"
+    assert body["adjusted"] is None
+    assert body["recommendation"] is None
+    assert body["ranges"] == [
+        {"range": "en", "position": 1, "original_q": 1.0, "reachable": False},
+        {"range": "zh", "position": 2, "original_q": 1.0, "reachable": False},
+    ]
+
+
+def test_q_steer_blank_header_target_not_default_unreachable():
+    response = _post_q_steer(
+        {
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "target_language": "zh-CN",
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "unreachable"
+    assert body["ranges"] == []
+    assert body["baseline"]["fallback"] is True
+
+
+def test_q_steer_blank_header_target_is_default_already_selected():
+    response = _post_q_steer(
+        {
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "target_language": "en-US",
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "already-selected"
+    assert body["baseline"]["fallback"] is True
+
+
+def test_q_steer_locale_fallback_adjusted_report():
+    response = _post_q_steer(
+        {
+            "accept_language": "gsw;q=0.9,fr;q=0.5",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "target_language": "ja-JP",
+            "locale_fallbacks": {"gsw": "zh-TW", "fr": "ja-JP"},
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "recommended"
+    assert body["recommendation"]["range"] == "gsw"
+    assert body["recommendation"]["new_q"] == 0.499
+    assert body["baseline"]["locale_fallback"]["source_range"] == "gsw"
+    assert body["adjusted"]["selected_language"] == "ja-JP"
+    assert body["adjusted"]["locale_fallback"]["source_range"] == "fr"
+
+
+def test_q_steer_target_not_in_supported_422():
+    response = _post_q_steer(
+        {
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "target_language": "fr-FR",
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "target_language"]
+    assert "supported_languages" in detail[0]["msg"]
+
+
+def test_q_steer_target_invalid_tag_422():
+    response = _post_q_steer(
+        {
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "target_language": "not a tag",
+        }
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "target_language"]
+
+
+def test_q_steer_target_missing_422():
+    response = _post_q_steer(
+        {
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 422
+
+
+def test_q_steer_invalid_header_returns_422():
+    response = _post_q_steer(
+        {
+            "accept_language": "en;q=2",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "target_language": "zh-CN",
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "accept_language"]
+    assert detail[0]["type"] == "accept_language.syntax_error"
+
+
+def test_q_steer_extra_field_rejected_422():
+    response = _post_q_steer(
+        {
+            "supported_languages": ["en"],
+            "default_language": "en",
+            "target_language": "en",
+            "unexpected": 1,
+        }
+    )
+    assert response.status_code == 422
+
+
 def _post_group(payload):
     return client.post("/api/v1/negotiate/group", json=payload)
 

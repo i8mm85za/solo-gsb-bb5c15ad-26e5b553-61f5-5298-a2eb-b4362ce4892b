@@ -13,6 +13,7 @@ from app.negotiation import (
     normalize_fallbacks,
     parse_accept_language,
     plan_coverage,
+    steer_q,
     truncation_chain,
     validate_fallback_chains,
 )
@@ -963,3 +964,253 @@ class TestQStability:
                     }
                     # The reported outside point must differ from baseline.
                     assert (selected, fell_back) != base_key
+
+
+class TestQSteer:
+    SUPPORTED = ["en-US", "zh-CN", "zh-TW", "ja-JP"]
+    DEFAULT = "en-US"
+
+    @staticmethod
+    def _rewrite(header, position, step):
+        # Independent re-implementation of the single-element q rewrite
+        # (same pattern as the q-stability brute-force property tests).
+        token = f"{step // 1000}.{step % 1000:03d}"
+        elements = header.split(",")
+        parts = elements[position - 1].split(";")
+        replaced = False
+        for index in range(1, len(parts)):
+            if parts[index].strip().split("=", 1)[0].strip() == "q":
+                head, _sep, _value = parts[index].partition("=")
+                parts[index] = head + "=" + token
+                replaced = True
+        if not replaced:
+            parts.append(f"q={token}")
+        elements[position - 1] = ";".join(parts)
+        return ",".join(elements)
+
+    def test_already_selected(self):
+        result = steer_q(
+            header="zh-CN,zh;q=0.9",
+            supported=self.SUPPORTED,
+            default=self.DEFAULT,
+            target_language="zh-CN",
+        )
+        assert result["status"] == "already-selected"
+        assert result["target_language"] == "zh-CN"
+        assert result["baseline"]["selected_language"] == "zh-CN"
+        assert result["adjusted"] == result["baseline"]
+        assert result["recommendation"] is None
+        assert result["ranges"] is None
+
+    def test_already_selected_via_default_fallback(self):
+        # No valid ranges: the default language is already served.
+        result = steer_q(
+            header=None,
+            supported=self.SUPPORTED,
+            default=self.DEFAULT,
+            target_language="en-US",
+        )
+        assert result["status"] == "already-selected"
+        assert result["baseline"]["fallback"] is True
+
+    def test_target_language_case_insensitive(self):
+        result = steer_q(
+            header="zh-CN",
+            supported=self.SUPPORTED,
+            default=self.DEFAULT,
+            target_language="ZH-cn",
+        )
+        # The canonical server-cased tag is echoed back.
+        assert result["status"] == "already-selected"
+        assert result["target_language"] == "zh-CN"
+
+    def test_minimal_change_tie_broken_by_header_order(self):
+        # en-US wins if zh drops to 0.8 (tie -> server order) or if en
+        # rises to 0.9; both changes are 0.1, so the earlier range wins.
+        result = steer_q(
+            header="zh;q=0.9,en;q=0.8",
+            supported=["en-US", "zh-CN"],
+            default="en-US",
+            target_language="en-US",
+        )
+        assert result["status"] == "recommended"
+        assert result["recommendation"] == {
+            "range": "zh",
+            "position": 1,
+            "original_q": 0.9,
+            "new_q": 0.8,
+        }
+        assert result["adjusted"]["selected_language"] == "en-US"
+        assert result["adjusted"]["fallback"] is False
+        assert result["ranges"] is None
+
+    def test_change_amount_beats_header_order(self):
+        # en (position 1) needs +0.501 to overtake zh; zeroing zh
+        # (position 2) falls back to the default en-US at only 0.5.
+        result = steer_q(
+            header="en;q=0,zh;q=0.5",
+            supported=["zh-CN", "en-US"],
+            default="en-US",
+            target_language="en-US",
+        )
+        assert result["status"] == "recommended"
+        assert result["recommendation"] == {
+            "range": "zh",
+            "position": 2,
+            "original_q": 0.5,
+            "new_q": 0.0,
+        }
+        # The target is reached via the default fallback here.
+        assert result["adjusted"]["selected_language"] == "en-US"
+        assert result["adjusted"]["fallback"] is True
+
+    def test_wildcard_range_scanned(self):
+        # Lowering the wildcard to 0 excludes everything -> default.
+        result = steer_q(
+            header="*;q=0.5",
+            supported=["en-US", "zh-CN"],
+            default="zh-CN",
+            target_language="zh-CN",
+        )
+        assert result["status"] == "recommended"
+        assert result["recommendation"]["range"] == "*"
+        assert result["recommendation"]["new_q"] == 0.0
+        assert result["adjusted"]["fallback"] is True
+
+    def test_duplicate_ranges_scanned_once_and_rewritten_at_first(self):
+        # The duplicate second en is ignored; the recommendation targets
+        # the first occurrence and the replay keeps the duplicate as-is.
+        result = steer_q(
+            header="en;q=0.8,en;q=0.2,zh;q=0.9",
+            supported=["en-US", "zh-CN"],
+            default="en-US",
+            target_language="en-US",
+        )
+        assert result["status"] == "recommended"
+        assert result["recommendation"] == {
+            "range": "en",
+            "position": 1,
+            "original_q": 0.8,
+            "new_q": 0.9,
+        }
+        assert result["adjusted"]["ignored_duplicates"] == [
+            {"range": "en", "position": 2}
+        ]
+        assert result["adjusted"]["selected_language"] == "en-US"
+
+    def test_locale_fallback_chain_steering(self):
+        # Lowering gsw below fr's 0.5 makes fr's chain win (ja-JP);
+        # raising fr above 0.9 also works at the same distance, and the
+        # earlier header position breaks the tie.
+        result = steer_q(
+            header="gsw;q=0.9,fr;q=0.5",
+            supported=self.SUPPORTED,
+            default=self.DEFAULT,
+            target_language="ja-JP",
+            locale_fallbacks={"gsw": "zh-TW", "fr": "ja-JP"},
+        )
+        assert result["status"] == "recommended"
+        assert result["recommendation"] == {
+            "range": "gsw",
+            "position": 1,
+            "original_q": 0.9,
+            "new_q": 0.499,
+        }
+        assert result["adjusted"]["selected_language"] == "ja-JP"
+        assert result["adjusted"]["locale_fallback"]["source_range"] == "fr"
+
+    def test_unreachable_lists_per_range_reachability(self):
+        result = steer_q(
+            header="en,zh",
+            supported=self.SUPPORTED,
+            default=self.DEFAULT,
+            target_language="ja-JP",
+        )
+        assert result["status"] == "unreachable"
+        assert result["adjusted"] is None
+        assert result["recommendation"] is None
+        assert result["ranges"] == [
+            {"range": "en", "position": 1, "original_q": 1.0, "reachable": False},
+            {"range": "zh", "position": 2, "original_q": 1.0, "reachable": False},
+        ]
+
+    def test_blank_header_unreachable_with_empty_ranges(self):
+        result = steer_q(
+            header=None,
+            supported=self.SUPPORTED,
+            default=self.DEFAULT,
+            target_language="zh-CN",
+        )
+        assert result["status"] == "unreachable"
+        assert result["ranges"] == []
+        assert result["baseline"]["fallback"] is True
+
+    @pytest.mark.parametrize(
+        "header,fallbacks,target",
+        [
+            ("zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5", None, "zh-TW"),
+            ("zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5", None, "en-US"),
+            ("zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5", None, "ja-JP"),
+            ("en;q=0,zh;q=0.5", None, "en-US"),
+            ("de;q=0.9,en;q=0.1,en;q=0.5,*;q=0.05", None, "zh-TW"),
+            ("gsw;q=0.9,fr;q=0.5", {"gsw": "zh-TW", "fr": "ja-JP"}, "ja-JP"),
+            ("gsw;q=0.9,fr;q=0.5", {"gsw": "zh-TW", "fr": "ja-JP"}, "en-US"),
+            ("*;q=0.5", None, "zh-CN"),
+            ("en;q=0.333", None, "zh-CN"),
+        ],
+    )
+    def test_recommendation_matches_brute_force(self, header, fallbacks, target):
+        # Property test: the recommendation must be the global minimum
+        # (change amount, header order, lower new q) over a literal scan
+        # of every range x grid point through the full negotiator.
+        result = steer_q(
+            header=header,
+            supported=self.SUPPORTED,
+            default=self.DEFAULT,
+            target_language=target,
+            locale_fallbacks=fallbacks,
+        )
+        if result["status"] == "already-selected":
+            assert result["baseline"]["selected_language"] == target
+            return
+
+        parsed = parse_accept_language(header)
+        best = None
+        for entry in parsed:
+            original_step = round(entry.q * 1000)
+            for step in range(1001):
+                if step == original_step:
+                    continue
+                outcome = negotiate(
+                    self._rewrite(header, entry.position, step),
+                    self.SUPPORTED,
+                    self.DEFAULT,
+                    fallbacks,
+                )
+                if outcome["selected_language"] != target:
+                    continue
+                key = (abs(step - original_step), entry.position, step)
+                if best is None or key < best[0]:
+                    best = (key, entry, step)
+
+        if best is None:
+            assert result["status"] == "unreachable"
+            assert all(not r["reachable"] for r in result["ranges"])
+            return
+
+        assert result["status"] == "recommended"
+        _key, entry, step = best
+        assert result["recommendation"] == {
+            "range": entry.range,
+            "position": entry.position,
+            "original_q": entry.q,
+            "new_q": step / 1000,
+        }
+        # The adjusted report is the full negotiation of the header with
+        # only the recommended range's q rewritten.
+        assert result["adjusted"] == negotiate(
+            self._rewrite(header, entry.position, step),
+            self.SUPPORTED,
+            self.DEFAULT,
+            fallbacks,
+        )

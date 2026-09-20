@@ -36,7 +36,13 @@ Implements the negotiation rules required by the service:
   the full three-decimal q grid (``0.000``..``1.000``) while the other
   ranges stay fixed, and reports the maximal contiguous grid interval
   around the original q that keeps ``selected_language`` and the
-  fallback state unchanged.
+  fallback state unchanged;
+* :func:`steer_q` reuses :func:`negotiate` plus the same lightweight
+  outcome mirror: given a target supported language it scans, for every
+  de-duplicated range individually, the full three-decimal q grid while
+  the other ranges stay fixed, and finds the minimal single-range q
+  change that makes the target the selected language; ties are broken
+  by change amount, then header order, then the lower new q.
 
 Language tag grammar follows RFC 5646 (BCP 47) primary tag grammar, which
 covers every ordinary language tag (the legacy "grandfathered" irregular
@@ -46,6 +52,7 @@ tags from the RFC registry are intentionally rejected).
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Any
@@ -847,51 +854,24 @@ def plan_coverage(
     }
 
 
-def analyze_q_stability(
-    header: str | None,
+def _grid_outcome_evaluator(
+    parsed: list[LanguageRange],
     supported: list[str],
     default: str,
-    locale_fallbacks: dict[str, str] | None = None,
-) -> dict[str, Any]:
-    """Analyze how far each range's q may move without changing the outcome.
-
-    Runs :func:`negotiate` once for the baseline outcome, then for every
-    de-duplicated parsed range finds the maximal contiguous run of the
-    RFC 9110 three-decimal q grid (``0.000``..``1.000``) that contains
-    the range's original q and yields the same ``selected_language``
-    *and* ``fallback`` flag as the baseline.
+    chains: dict[str, str],
+) -> Callable[[list[LanguageRange]], tuple[str, bool]]:
+    """Build the lightweight negotiate() mirror used by q-grid scans.
 
     Match resolution (concrete range vs wildcard vs nothing, truncation
-    prefixes, q=0 exclusion) depends only on the *tags*, never on q
-    values, so it is precomputed once per candidate; while scanning one
-    range's q, every other range keeps its parsed q. A grid step is then
-    evaluated by a lightweight mirror of :func:`negotiate`'s selection
-    logic (winner by q then server order, then the locale_fallbacks
-    chain, then the default fallback) that only reads the precomputed
-    matches -- no header is re-parsed. Moreover, as the scanned q moves,
-    the (selected_language, fallback) pair can change only when the
-    scanned weight crosses 0 or another range's weight (ties resolved at
-    equality), i.e. at a small set of event steps; the outcome is
-    constant between them, so at most O(number of ranges) grid points
-    per range need evaluating. Wildcards, truncation matching and q=0
-    exclusion are therefore the exact same rules; a missing/blank
-    header contains no ranges, so its stability report is empty.
+    prefixes) depends only on the *tags*, never on q values, so the
+    per-candidate effective range is precomputed once from ``parsed``.
+    The returned callable mirrors negotiate()'s winner/fallback decision
+    for a ranges list with the same tags/positions but altered q values
+    -- winner by q then server order, then the locale_fallbacks chain,
+    then the default fallback -- without re-parsing any header.
+    ``chains`` must already be normalized to lowercase.
     """
 
-    baseline = negotiate(
-        header=header,
-        supported=supported,
-        default=default,
-        locale_fallbacks=locale_fallbacks,
-    )
-    parsed = parse_accept_language(header)
-    baseline_key = (baseline["selected_language"], baseline["fallback"])
-
-    chains = (
-        {source.lower(): target.lower() for source, target in locale_fallbacks.items()}
-        if locale_fallbacks
-        else {}
-    )
     supported_lower_to_index = {
         tag.lower(): index for index, tag in enumerate(supported)
     }
@@ -907,9 +887,7 @@ def analyze_q_stability(
         wildcard = _wildcard_range(parsed) if matched is None else None
         candidate_effective.append((matched, wildcard))
 
-    def outcome(
-        ranges: list[LanguageRange],
-    ) -> tuple[str, bool]:
+    def outcome(ranges: list[LanguageRange]) -> tuple[str, bool]:
         """Mirror of negotiate()'s winner/fallback decision on ranges."""
 
         q_by_range = {entry.range: entry.q for entry in ranges}
@@ -968,6 +946,81 @@ def analyze_q_stability(
         if selected_index is None:
             return supported[default_index], True
         return supported[selected_index], False
+
+    return outcome
+
+
+def _rewrite_header_q(header: str, position: int, step: int) -> str:
+    """Return ``header`` with one element's q replaced by a grid value.
+
+    ``position`` is the 1-based index of the comma-separated element to
+    change; its q parameter(s) are rewritten to the three-decimal token
+    for ``step / Q_GRID_STEPS`` (a missing q parameter is appended).
+    Every other element keeps its exact raw spelling, so re-parsing the
+    result differs from parsing ``header`` only in that range's q.
+    """
+
+    token = f"{step // Q_GRID_STEPS}.{step % Q_GRID_STEPS:03d}"
+    elements = header.split(",")
+    parts = elements[position - 1].split(";")
+    replaced = False
+    for index in range(1, len(parts)):
+        if parts[index].strip().split("=", 1)[0].strip() == "q":
+            head, _sep, _value = parts[index].partition("=")
+            parts[index] = head + "=" + token
+            replaced = True
+    if not replaced:
+        parts.append(f"q={token}")
+    elements[position - 1] = ";".join(parts)
+    return ",".join(elements)
+
+
+def analyze_q_stability(
+    header: str | None,
+    supported: list[str],
+    default: str,
+    locale_fallbacks: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Analyze how far each range's q may move without changing the outcome.
+
+    Runs :func:`negotiate` once for the baseline outcome, then for every
+    de-duplicated parsed range finds the maximal contiguous run of the
+    RFC 9110 three-decimal q grid (``0.000``..``1.000``) that contains
+    the range's original q and yields the same ``selected_language``
+    *and* ``fallback`` flag as the baseline.
+
+    Match resolution (concrete range vs wildcard vs nothing, truncation
+    prefixes, q=0 exclusion) depends only on the *tags*, never on q
+    values, so it is precomputed once per candidate; while scanning one
+    range's q, every other range keeps its parsed q. A grid step is then
+    evaluated by a lightweight mirror of :func:`negotiate`'s selection
+    logic (winner by q then server order, then the locale_fallbacks
+    chain, then the default fallback) that only reads the precomputed
+    matches -- no header is re-parsed. Moreover, as the scanned q moves,
+    the (selected_language, fallback) pair can change only when the
+    scanned weight crosses 0 or another range's weight (ties resolved at
+    equality), i.e. at a small set of event steps; the outcome is
+    constant between them, so at most O(number of ranges) grid points
+    per range need evaluating. Wildcards, truncation matching and q=0
+    exclusion are therefore the exact same rules; a missing/blank
+    header contains no ranges, so its stability report is empty.
+    """
+
+    baseline = negotiate(
+        header=header,
+        supported=supported,
+        default=default,
+        locale_fallbacks=locale_fallbacks,
+    )
+    parsed = parse_accept_language(header)
+    baseline_key = (baseline["selected_language"], baseline["fallback"])
+
+    chains = (
+        {source.lower(): target.lower() for source, target in locale_fallbacks.items()}
+        if locale_fallbacks
+        else {}
+    )
+    outcome = _grid_outcome_evaluator(parsed, supported, default, chains)
 
     def outcome_with_q(target: LanguageRange, q: float) -> tuple[str, bool]:
         varied = LanguageRange(
@@ -1056,3 +1109,145 @@ def analyze_q_stability(
         )
 
     return {"baseline": baseline, "ranges": range_reports}
+
+
+def steer_q(
+    header: str | None,
+    supported: list[str],
+    default: str,
+    target_language: str,
+    locale_fallbacks: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Find the minimal single-range q change that selects the target.
+
+    Runs :func:`negotiate` once for the baseline outcome. When the
+    baseline already selects ``target_language`` the status is
+    ``already-selected`` and no change is proposed. Otherwise every
+    de-duplicated parsed range is scanned individually over the full
+    RFC 9110 three-decimal q grid (``0.000``..``1.000``) while the
+    other ranges keep their parsed q, using the same lightweight
+    outcome mirror as :func:`analyze_q_stability` -- wildcards,
+    truncation matching, q=0 exclusion and locale_fallbacks chains
+    follow the exact rules of :func:`negotiate`. A grid step
+    *succeeds* when the resulting ``selected_language`` equals the
+    target, including selection via the default fallback (the adjusted
+    report's ``fallback`` flag marks that case).
+
+    Among all succeeding (range, new q) pairs the winner is the minimal
+    change: smallest ``|new_q - original_q|`` first, ties broken by
+    header order (the range's position), then by the lower new q. The
+    winning change is replayed through :func:`negotiate` with only that
+    range's header element rewritten, producing the full adjusted
+    report; the status is ``recommended`` and the recommendation
+    carries the range, its original q and the new q. When no
+    single-range change can select the target the status is
+    ``unreachable`` and every de-duplicated range is listed with its
+    reachability.
+
+    ``target_language`` must be contained in ``supported``
+    case-insensitively (enforced by the request schema); the canonical
+    server-cased tag is echoed back as ``target_language``.
+    """
+
+    baseline = negotiate(
+        header=header,
+        supported=supported,
+        default=default,
+        locale_fallbacks=locale_fallbacks,
+    )
+    # The request schema guarantees case-insensitive membership, so the
+    # canonical (server-cased) target tag always exists.
+    target = next(
+        tag for tag in supported if tag.lower() == target_language.lower()
+    )
+
+    if baseline["selected_language"] == target:
+        return {
+            "status": "already-selected",
+            "target_language": target,
+            "baseline": baseline,
+            "adjusted": baseline,
+            "recommendation": None,
+            "ranges": None,
+        }
+
+    parsed = parse_accept_language(header)
+    chains = (
+        {source.lower(): target.lower() for source, target in locale_fallbacks.items()}
+        if locale_fallbacks
+        else {}
+    )
+    outcome = _grid_outcome_evaluator(parsed, supported, default, chains)
+
+    # best_key orders the full tie-break contract: change amount in
+    # grid steps, then header position, then the lower new q step.
+    best_key: tuple[int, int, int] | None = None
+    best_entry: LanguageRange | None = None
+    best_step = 0
+    reachability: list[dict[str, Any]] = []
+    for entry in parsed:
+        original_step = round(entry.q * Q_GRID_STEPS)
+        reachable = False
+        for step in range(Q_GRID_STEPS + 1):
+            if step == original_step:
+                # Keeping the original q is not a change (and cannot
+                # succeed anyway: it would reproduce the baseline).
+                continue
+            varied = LanguageRange(
+                range=entry.range,
+                q=step / Q_GRID_STEPS,
+                position=entry.position,
+            )
+            ranges = [varied if other is entry else other for other in parsed]
+            selected, _fell_back = outcome(ranges)
+            if selected != target:
+                continue
+            reachable = True
+            key = (abs(step - original_step), entry.position, step)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_entry = entry
+                best_step = step
+        reachability.append(
+            {
+                "range": entry.range,
+                "position": entry.position,
+                "original_q": entry.q,
+                "reachable": reachable,
+            }
+        )
+
+    if best_key is None or best_entry is None:
+        return {
+            "status": "unreachable",
+            "target_language": target,
+            "baseline": baseline,
+            "adjusted": None,
+            "recommendation": None,
+            "ranges": reachability,
+        }
+
+    # Replay the winning change through the full negotiator: only the
+    # recommended range's header element is rewritten, every other
+    # element keeps its raw spelling (duplicates, wildcard, q=0 ranges
+    # and locale_fallbacks all behave exactly as in the baseline).
+    rewritten = _rewrite_header_q(header or "", best_entry.position, best_step)
+    adjusted = negotiate(
+        header=rewritten,
+        supported=supported,
+        default=default,
+        locale_fallbacks=locale_fallbacks,
+    )
+    return {
+        "status": "recommended",
+        "target_language": target,
+        "baseline": baseline,
+        "adjusted": adjusted,
+        "recommendation": {
+            "range": best_entry.range,
+            "position": best_entry.position,
+            "original_q": best_entry.q,
+            "new_q": best_step / Q_GRID_STEPS,
+        },
+        "ranges": None,
+    }

@@ -43,12 +43,16 @@ def _check_default_tag(value: str) -> str:
     return value
 
 
-def _check_default_in_supported(supported: list[str], default: str) -> None:
-    supported_lower = {tag.lower() for tag in supported}
-    if default.lower() not in supported_lower:
+def _check_tag_in_supported(supported: list[str], tag: str, field: str) -> None:
+    supported_lower = {item.lower() for item in supported}
+    if tag.lower() not in supported_lower:
         raise ValueError(
-            "default_language 必须包含在 supported_languages 中（大小写不敏感）"
+            f"{field} 必须包含在 supported_languages 中（大小写不敏感）"
         )
+
+
+def _check_default_in_supported(supported: list[str], default: str) -> None:
+    _check_tag_in_supported(supported, default, "default_language")
 
 
 class NegotiationRequest(BaseModel):
@@ -125,6 +129,37 @@ class NegotiationRequest(BaseModel):
     def _default_must_be_supported(self) -> "NegotiationRequest":
         _check_default_in_supported(self.supported_languages, self.default_language)
         return self
+
+
+class QSteerRequest(NegotiationRequest):
+    """Q-steering input: a single negotiation request plus a target.
+
+    Inherits every field and validation rule of
+    :class:`NegotiationRequest` (including ``locale_fallbacks``) and
+    adds ``target_language``, the supported language the server should
+    try to steer the negotiation outcome towards.
+    """
+
+    target_language: str = Field(
+        title="目标语言标签",
+        description="必须包含在 supported_languages 中（大小写不敏感）",
+    )
+
+    @field_validator("target_language")
+    @classmethod
+    def _validate_target(cls, value: str, info: ValidationInfo) -> str:
+        if not TAG_RE.fullmatch(value):
+            raise ValueError(
+                f"target_language 不是合法的 BCP 47 标签: {value!r}"
+            )
+        # Runs after the inherited supported_languages validator (field
+        # declaration order), so membership errors are located at
+        # ["body", "target_language"].
+        if info.data.get("supported_languages"):
+            _check_tag_in_supported(
+                info.data["supported_languages"], value, "target_language"
+            )
+        return value
 
 
 class TraceEvent(BaseModel):
@@ -222,6 +257,58 @@ class QStabilityResponse(BaseModel):
     )
     ranges: list[QStabilityRangeReport] = Field(
         description="去重后每个语言范围各自的权重稳定区间（按头部顺序）"
+    )
+
+
+class QSteerRecommendation(BaseModel):
+    """The winning minimal single-range q change."""
+
+    range: str = Field(description="被调整的去重后语言范围（小写；可能为 '*' 通配符）")
+    position: int = Field(
+        description="该范围在原始 Accept-Language 头中的位置（从 1 开始）"
+    )
+    original_q: float = Field(description="该范围在原始请求中的 q")
+    new_q: float = Field(description="建议改成的新 q（三位小数网格点）")
+
+
+class QSteerRangeReachability(BaseModel):
+    """Whether one de-duplicated range alone can steer the outcome to the target."""
+
+    range: str = Field(description="去重后的语言范围（小写；可能为 '*' 通配符）")
+    position: int = Field(
+        description="该范围在原始 Accept-Language 头中的位置（从 1 开始）"
+    )
+    original_q: float = Field(description="该范围在原始请求中的 q")
+    reachable: bool = Field(
+        description="单独调整该范围的 q（其余范围不变）是否能让目标语言被选中"
+    )
+
+
+class QSteerResponse(BaseModel):
+    status: Literal["already-selected", "recommended", "unreachable"] = Field(
+        description=(
+            "already-selected：基准结果已选中目标语言；"
+            "recommended：找到让目标语言胜出的最小单项 q 改动；"
+            "unreachable：任何单项 q 改动都无法选中目标语言"
+        )
+    )
+    target_language: str = Field(
+        description="目标语言（回显 supported_languages 中的服务端原始大小写）"
+    )
+    baseline: NegotiationResponse = Field(
+        description="未改动请求的基准协商结果（与 /negotiate 完全一致）"
+    )
+    adjusted: NegotiationResponse | None = Field(
+        description=(
+            "应用建议改动后的协商结果；already-selected 时与 baseline 相同，"
+            "unreachable 时为 null"
+        )
+    )
+    recommendation: QSteerRecommendation | None = Field(
+        description="status 为 recommended 时的最小单项改动；否则为 null"
+    )
+    ranges: list[QSteerRangeReachability] | None = Field(
+        description="status 为 unreachable 时逐范围列出可达性（按头部顺序）；否则为 null"
     )
 
 

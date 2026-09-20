@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -14,6 +16,7 @@ from .negotiation import (
     negotiate,
     negotiate_group,
     plan_coverage,
+    steer_q,
 )
 from .schemas import (
     CoveragePlanRequest,
@@ -24,6 +27,8 @@ from .schemas import (
     NegotiationRequest,
     NegotiationResponse,
     QStabilityResponse,
+    QSteerRequest,
+    QSteerResponse,
 )
 app = FastAPI(
     title="HTTP 语言协商解释 API",
@@ -35,6 +40,8 @@ app = FastAPI(
         "另提供 /api/v1/negotiate/group 群体协商：对多位参与者逐人复用相同的"
         "匹配语义构成权重矩阵，具体范围 q=0 全局否决，按最低个人权重 → 总权重 → "
         "服务端顺序选出共同接受的语言。"
+        "另提供 /api/v1/negotiate/q-steer 目标引导：对去重后的每个语言范围单独"
+        "扫描三位小数 q 网格，找出让指定目标语言胜出的最小单项 q 改动。"
     ),
     version=__version__,
 )
@@ -61,6 +68,20 @@ async def accept_language_error_handler(
 
 # Pydantic request validation uses FastAPI's built-in 422 handler,
 # which returns the standard {"detail": [...]} envelope.
+
+
+def _negotiation_body(result: dict[str, Any]) -> dict[str, Any]:
+    """Serialize a negotiate() result, dropping a null locale_fallback.
+
+    Matches /negotiate: when locale_fallbacks did not participate the
+    key is dropped rather than emitted null, keeping the exact
+    pre-feature key set.
+    """
+
+    response = NegotiationResponse.model_validate(result)
+    if response.locale_fallback is None:
+        return response.model_dump(exclude={"locale_fallback"})
+    return response.model_dump()
 
 
 @app.exception_handler(SampleHeaderError)
@@ -173,6 +194,37 @@ async def negotiate_q_stability(
 
 
 @app.post(
+    "/api/v1/negotiate/q-steer",
+    response_model=QSteerResponse,
+    tags=["语言协商"],
+    summary="目标语言引导：最小单项 q 改动推荐",
+)
+async def negotiate_q_steer(
+    payload: QSteerRequest,
+) -> JSONResponse:
+    result = steer_q(
+        header=payload.accept_language,
+        supported=payload.supported_languages,
+        default=payload.default_language,
+        target_language=payload.target_language,
+        locale_fallbacks=payload.locale_fallbacks,
+    )
+    body = {
+        "status": result["status"],
+        "target_language": result["target_language"],
+        "baseline": _negotiation_body(result["baseline"]),
+        "adjusted": (
+            _negotiation_body(result["adjusted"])
+            if result["adjusted"] is not None
+            else None
+        ),
+        "recommendation": result["recommendation"],
+        "ranges": result["ranges"],
+    }
+    return JSONResponse(content=body)
+
+
+@app.post(
     "/api/v1/negotiate/group",
     response_model=GroupNegotiationResponse,
     tags=["语言协商"],
@@ -217,5 +269,6 @@ async def root() -> dict[str, str]:
         "health": "/health",
         "negotiate": "POST /api/v1/negotiate",
         "negotiate_q_stability": "POST /api/v1/negotiate/q-stability",
+        "negotiate_q_steer": "POST /api/v1/negotiate/q-steer",
         "negotiate_group": "POST /api/v1/negotiate/group",
     }
